@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -33,14 +32,14 @@ from r1_v.open_r1.trainer import (
     Qwen2VLGRPOToolTrainer,
     Qwen2VLGRPOToolVLLMTrainer,
 )
-from r1_v.open_r1.trainer.tool_generation import parse_tool_config
+from r1_v.open_r1.trainer.strict_tool_schema import extract_terminate_answer, score_tool_message
 
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy"],
-        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
+        default_factory=lambda: ["accuracy", "format"],
+        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format', 'strict_format'"},
     )
     max_pixels: Optional[int] = field(
         default=12845056,
@@ -61,6 +60,20 @@ class GRPOScriptArguments(ScriptArguments):
     )
 
 
+def _extract_ground_truth(solution_text: str) -> str:
+    match = re.search(r"<answer>(.*?)</answer>", solution_text)
+    return match.group(1).strip() if match else solution_text.strip()
+
+
+def _answers_match(student_answer: str, ground_truth: str) -> bool:
+    if student_answer == ground_truth:
+        return True
+    try:
+        return float(verify(parse(student_answer), parse(ground_truth))) > 0
+    except Exception:
+        return False
+
+
 def accuracy_reward(completions, solution, **kwargs):
     contents = [completion[0]["content"] for completion in completions]
     output_texts = kwargs.get("model_output_texts")
@@ -70,29 +83,9 @@ def accuracy_reward(completions, solution, **kwargs):
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
     for item, sol in zip(items_to_score, solution):
         content = item[-1]
-        reward = 0.0
-        try:
-            answer = parse(content)
-            if float(verify(answer, parse(sol))) > 0:
-                reward = 1.0
-        except Exception:
-            pass
-
-        if reward == 0.0:
-            try:
-                sol_match = re.search(r"<answer>(.*?)</answer>", sol)
-                ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-
-                tool_cfg = parse_tool_config(content)
-                if tool_cfg:
-                    student_answer = tool_cfg[0].get("API_params", {}).get("ans", content)
-                else:
-                    student_answer = content
-
-                if student_answer == ground_truth or float(verify(parse(student_answer), parse(ground_truth))) > 0:
-                    reward = 1.0
-            except Exception:
-                pass
+        ground_truth = _extract_ground_truth(sol)
+        student_answer = extract_terminate_answer(content) or content.strip()
+        reward = 1.0 if _answers_match(student_answer, ground_truth) else 0.0
 
         rewards.append(reward)
         if os.getenv("DEBUG_MODE") == "true":
@@ -100,40 +93,26 @@ def accuracy_reward(completions, solution, **kwargs):
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"Content: {item}\n")
+                f.write(f"Parsed student answer: {student_answer}\n")
                 f.write(f"Solution: {sol}\n")
     return rewards
 
 
 def format_reward(completions, **kwargs):
     output_texts = kwargs.get("model_output_texts")
-    if not output_texts:
-        pattern = r".*Terminate.*"
-        completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
-        return [1.0 if match else 0.0 for match in matches]
+    trajectories = output_texts if output_texts else [[completion[0]["content"]] for completion in completions]
 
     rewards = []
-    pattern = r"\{(?:[^{}]|\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})*\}"
-    for output_text in output_texts:
-        current_rewards = []
-        for output_text_item in output_text:
-            reward = 0.0
-            try:
-                match = re.search(pattern, output_text_item)
-                assert match is not None
-                data = json.loads(match.group(0))
-                assert "thought" in data or "thoughts" in data or "actions" in data
-                reward = 1.0
-            except Exception:
-                reward = 0.0
-            current_rewards.append(reward)
-        rewards.append(sum(current_rewards) / len(current_rewards) if current_rewards else 0.0)
+    for trajectory in trajectories:
+        step_scores = [score_tool_message(output_text_item) for output_text_item in trajectory]
+        rewards.append(sum(step_scores) / len(step_scores) if step_scores else 0.0)
     return rewards
 
 
 reward_funcs_registry = {
     "accuracy": accuracy_reward,
     "format": format_reward,
+    "strict_format": format_reward,
 }
 
 
@@ -146,12 +125,18 @@ SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving 
 - **DrawVerticalLineByX**: Draws a vertical line at a given x-coordinate. Example: `{"name": "DrawVerticalLineByX", "arguments": {"image": "img_1", "param": "x=21.5"}}`
 - **Terminate**: Ends the task and provides the final answer. Example: `{"name": "Terminate", "arguments": {"ans": "1985"}}`
 
+Strict formatting rules:
+1. Your entire response must be exactly one JSON object with top-level keys "thought" and "actions".
+2. Output exactly one action per response.
+3. Tool names are case-sensitive and must exactly match the names above.
+4. `SegmentRegionAroundPoint.arguments.param` must exactly match `x="<number>" y="<number>"` with no extra spaces.
+5. `DrawHorizontalLineByY.arguments.param` must exactly match `y=<number>`.
+6. `DrawVerticalLineByX.arguments.param` must exactly match `x=<number>`.
+7. `Terminate.arguments.ans` must always be a JSON string, even for numeric answers, for example `{"ans": "2000"}`.
+
 To solve the problem:
 1. Select actions from the provided tools list, combining them logically and building on previous steps. Call one action at a time, using its output for the next.
-2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call \"Point\" to get coordinates for further actions.
-
-Your output should be in a strict JSON format as follows:
-{"thought": "the reasoning process", "actions": [{"name": "action", "arguments": {"argument1": "value1", "argument2": "value2"}}]}
+2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call "Point" to get coordinates for further actions.
 """
 
 
