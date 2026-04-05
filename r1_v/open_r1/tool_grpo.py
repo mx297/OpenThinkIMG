@@ -30,7 +30,8 @@ from r1_v.open_r1.trainer import (
     Qwen2VLGRPOTrainer,
     Qwen2VLGRPOVLLMTrainer,
     Qwen2VLGRPOToolTrainer,
-    Qwen2VLGRPOToolVLLMTrainer,
+    Qwen2VLGRPOToolVLLMTrainerLegacy,
+    Qwen2VLGRPOToolVLLMTrainerSafe,
 )
 from r1_v.open_r1.trainer.strict_tool_schema import extract_terminate_answer, score_tool_message
 
@@ -52,6 +53,10 @@ class GRPOScriptArguments(ScriptArguments):
     use_tool: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether to use tool trainer for training"},
+    )
+    tool_runtime_variant: str = field(
+        default="safe",
+        metadata={"help": "Tool runtime implementation to use when --use_tool and --use_vllm are enabled. One of: 'safe', 'legacy'."},
     )
     query_key: Optional[str] = field(default="question")
     controller_addr: Optional[str] = field(
@@ -91,10 +96,10 @@ def accuracy_reward(completions, solution, **kwargs):
         if os.getenv("DEBUG_MODE") == "true":
             log_path = os.getenv("LOG_PATH")
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
-                f.write(f"Content: {item}\n")
-                f.write(f"Parsed student answer: {student_answer}\n")
-                f.write(f"Solution: {sol}\n")
+                f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\\n")
+                f.write(f"Content: {item}\\n")
+                f.write(f"Parsed student answer: {student_answer}\\n")
+                f.write(f"Solution: {sol}\\n")
     return rewards
 
 
@@ -120,7 +125,7 @@ SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving 
 - **OCR**: Extracts text from an image. Example: `{"name": "OCR", "arguments": {"image": "img_1"}}`
 - **Point**: Identifies a point in the image based on description and returns coordinates. Example: `{"name": "Point", "arguments": {"image": "img_1", "param": "x-axis value 1970"}}`
 - **ZoomInSubfigure**: Crops the image to the specified subfigure. Example: `{"name": "ZoomInSubfigure", "arguments": {"image": "img_1", "param": "Downstream vs. Concept: Toy"}}`
-- **SegmentRegionAroundPoint**: Segments a region around a given point. Example: `{"name": "SegmentRegionAroundPoint", "arguments": {"image": "img_1", "param": "x=\"21.5\" y=\"28.5\""}}`
+- **SegmentRegionAroundPoint**: Segments a region around a given point. Example: `{"name": "SegmentRegionAroundPoint", "arguments": {"image": "img_1", "param": "x=\\"21.5\\" y=\\"28.5\\""}}`
 - **DrawHorizontalLineByY**: Draws a horizontal line at a given y-coordinate. Example: `{"name": "DrawHorizontalLineByY", "arguments": {"image": "img_1", "param": "y=28.5"}}`
 - **DrawVerticalLineByX**: Draws a vertical line at a given x-coordinate. Example: `{"name": "DrawVerticalLineByX", "arguments": {"image": "img_1", "param": "x=21.5"}}`
 - **Terminate**: Ends the task and provides the final answer. Example: `{"name": "Terminate", "arguments": {"ans": "1985"}}`
@@ -138,6 +143,16 @@ To solve the problem:
 1. Select actions from the provided tools list, combining them logically and building on previous steps. Call one action at a time, using its output for the next.
 2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call "Point" to get coordinates for further actions.
 """
+
+
+def _get_tool_vllm_trainer(runtime_variant: str):
+    if runtime_variant == "safe":
+        return Qwen2VLGRPOToolVLLMTrainerSafe
+    if runtime_variant == "legacy":
+        return Qwen2VLGRPOToolVLLMTrainerLegacy
+    raise ValueError(
+        f"Unsupported tool_runtime_variant={runtime_variant!r}. Expected one of: 'safe', 'legacy'."
+    )
 
 
 def main(script_args, training_args, model_args):
@@ -201,7 +216,10 @@ def main(script_args, training_args, model_args):
             dataset = dataset.remove_columns("query")
 
     if script_args.use_tool:
-        trainer_cls = Qwen2VLGRPOToolTrainer if not training_args.use_vllm else Qwen2VLGRPOToolVLLMTrainer
+        if training_args.use_vllm:
+            trainer_cls = _get_tool_vllm_trainer(script_args.tool_runtime_variant)
+        else:
+            trainer_cls = Qwen2VLGRPOToolTrainer
         trainer = trainer_cls(
             model=model_args.model_name_or_path,
             reward_funcs=reward_funcs,
@@ -228,6 +246,8 @@ def main(script_args, training_args, model_args):
             min_pixels=script_args.min_pixels,
         )
     print("using: ", trainer_cls)
+    if script_args.use_tool and training_args.use_vllm:
+        print("tool_runtime_variant:", script_args.tool_runtime_variant)
 
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
