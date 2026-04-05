@@ -12,36 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
-import json
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
+
+from datasets import load_dataset
 from PIL import Image
-from datasets import load_dataset, load_from_disk
-from transformers import Qwen2VLForConditionalGeneration
-from transformers.trainer_utils import get_last_checkpoint
 from transformers import set_seed
+from transformers.trainer_utils import get_last_checkpoint
 
 from math_verify import parse, verify
-# from open_r1.trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainer
-from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from trl import GRPOConfig, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+
+from r1_v.open_r1.trainer import (
+    Qwen2VLGRPOTrainer,
+    Qwen2VLGRPOVLLMTrainer,
+    Qwen2VLGRPOToolTrainer,
+    Qwen2VLGRPOToolVLLMTrainer,
+)
 from r1_v.open_r1.trainer.tool_generation import parse_tool_config
-from r1_v.open_r1.trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainer, Qwen2VLGRPOToolTrainer, Qwen2VLGRPOToolVLLMTrainer
+
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
-    """
-    Script arguments for the GRPO training script.
-
-    Args:
-        reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format'.
-    """
-
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy"], # "format","accuracy"
+        default_factory=lambda: ["accuracy"],
         metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
     )
     max_pixels: Optional[int] = field(
@@ -52,13 +50,11 @@ class GRPOScriptArguments(ScriptArguments):
         default=3136,
         metadata={"help": "Minimum number of pixels for the image"},
     )
-    use_tool: Optional[bool]  = field(
+    use_tool: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether to use tool trainer for training"},
     )
-    query_key: Optional[str] = field(
-        default="question",
-    )
+    query_key: Optional[str] = field(default="question")
     controller_addr: Optional[str] = field(
         default="http://SH-IDCA1404-10-140-54-5:20001",
         metadata={"help": "Address of the controller"},
@@ -66,95 +62,73 @@ class GRPOScriptArguments(ScriptArguments):
 
 
 def accuracy_reward(completions, solution, **kwargs):
-    """Reward function that checks if the completion is correct using either symbolic verification or exact string matching."""
-
-
     contents = [completion[0]["content"] for completion in completions]
+    output_texts = kwargs.get("model_output_texts")
+    items_to_score = output_texts if output_texts else [[content] for content in contents]
+
     rewards = []
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-    output_texts = kwargs.get("model_output_texts", None)
-    
-    if output_texts:
-        renewed_contents = []
-        for output_text in output_texts:
-            renewed_contents.append(output_text[-1])
-    else:
-        renewed_contents = contents
-        
-    for item, sol in zip(output_texts, solution):
-        content = item[-1] 
+    for item, sol in zip(items_to_score, solution):
+        content = item[-1]
         reward = 0.0
-        # Try symbolic verification first
         try:
             answer = parse(content)
             if float(verify(answer, parse(sol))) > 0:
                 reward = 1.0
         except Exception:
-            pass  # Continue to next verification method if this fails
+            pass
 
-        # If symbolic verification failed, try string matching
         if reward == 0.0:
             try:
-                # Extract answer from solution if it has think/answer tags
-                sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+                sol_match = re.search(r"<answer>(.*?)</answer>", sol)
                 ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-                
-                # Extract answer from content if it has think/answer tags
+
                 tool_cfg = parse_tool_config(content)
                 if tool_cfg:
                     student_answer = tool_cfg[0].get("API_params", {}).get("ans", content)
                 else:
                     student_answer = content
-                # content_match = re.search(r'<answer>(.*?)</answer>', content)
-                # student_answer = content_match.group(1).strip() if content_match else content.strip()
-                
-                # Compare the extracted answers
+
                 if student_answer == ground_truth or float(verify(parse(student_answer), parse(ground_truth))) > 0:
                     reward = 1.0
             except Exception:
-                pass  # Keep reward as 0.0 if both methods fail
-                
+                pass
+
         rewards.append(reward)
         if os.getenv("DEBUG_MODE") == "true":
             log_path = os.getenv("LOG_PATH")
-            # local_rank = int(os.getenv("LOCAL_RANK", 0))
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"Content: {item}\n")
                 f.write(f"Solution: {sol}\n")
-        # breakpoint()
     return rewards
 
 
 def format_reward(completions, **kwargs):
-    """Reward function that checks if the completion has a specific format, in this case, if it contains the word 'Terminate'."""
-    # breakpoint()
-    output_texts = kwargs.get("model_output_texts", None)
+    output_texts = kwargs.get("model_output_texts")
     if not output_texts:
-        pattern = r'.*Terminate.*'
+        pattern = r".*Terminate.*"
         completion_contents = [completion[0]["content"] for completion in completions]
         matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
         return [1.0 if match else 0.0 for match in matches]
-    else:
-        rewards = []
-        pattern = r'\{(?:[^{}]|\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})*\}'
-        for output_text in output_texts:
-            current_rewards = []
-            for output_text_item in output_text:
+
+    rewards = []
+    pattern = r"\{(?:[^{}]|\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})*\}"
+    for output_text in output_texts:
+        current_rewards = []
+        for output_text_item in output_text:
+            reward = 0.0
+            try:
+                match = re.search(pattern, output_text_item)
+                assert match is not None
+                data = json.loads(match.group(0))
+                assert "thought" in data or "thoughts" in data or "actions" in data
+                reward = 1.0
+            except Exception:
                 reward = 0.0
-                try:
-                    match = re.search(pattern, output_text_item)
-                    assert match is not None
-                    data = json.loads(match.group(0))
-                    assert "thought" in data or "thoughts" in data or "actions" in data
-                    reward = 1.0
-                except Exception:
-                    reward = 0.0
-                current_rewards.append(reward)
-            current_reward = sum(current_rewards) / len(current_rewards) if current_rewards else 0.0
-            rewards.append(current_reward)
-        return rewards
-        
+            current_rewards.append(reward)
+        rewards.append(sum(current_rewards) / len(current_rewards) if current_rewards else 0.0)
+    return rewards
 
 
 reward_funcs_registry = {
@@ -162,20 +136,6 @@ reward_funcs_registry = {
     "format": format_reward,
 }
 
-# SYSTEM_PROMPT = (
-#     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-#     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-#     "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-#     "<think> reasoning process here </think><answer> answer here </answer>"
-# )
-# SYSTEM_PROMPT = (
-#     "[BEGIN OF GOAL] You are a visual assistant capable of generating and solving steps for chart-based reasoning. Your goal is to answer chart-related questions. You can rely on your own capabilities or use external tools to assist in solving. The available actions include: OCR, Point, DrawHorizontalLineByY, DrawVerticalLineByX, ZoomInSubfigure, and SegmentRegionAroundPoint. [END OF GOAL] \n\n"
-# )
-
-# SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving steps for chart-based reasoning. Your goal is to answer chart-related questions. You can rely on your own capabilities or use external tools to assist in solving. The available actions include: OCR, Point, DrawHorizontalLineByY, DrawVerticalLineByX, ZoomInSubfigure, and SegmentRegionAroundPoint.
-# Your output should be in a strict JSON format as follows:
-# {"thought": "the reasoning process", "actions": [{"name": "action", "arguments": {"argument1": "value1", "argument2": "value2"}}]}
-# """
 
 SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving steps for chart-based reasoning. Your goal is to answer chart-related questions. You can rely on your own capabilities or use external tools to assist in solving. Here are the available actions:
 - **OCR**: Extracts text from an image. Example: `{"name": "OCR", "arguments": {"image": "img_1"}}`
@@ -188,41 +148,34 @@ SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving 
 
 To solve the problem:
 1. Select actions from the provided tools list, combining them logically and building on previous steps. Call one action at a time, using its output for the next.
-2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call "Point" to get coordinates for further actions.
+2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call \"Point\" to get coordinates for further actions.
 
 Your output should be in a strict JSON format as follows:
 {"thought": "the reasoning process", "actions": [{"name": "action", "arguments": {"argument1": "value1", "argument2": "value2"}}]}
 """
 
+
 def main(script_args, training_args, model_args):
-    # Set seed for reproducibility
     set_seed(training_args.seed)
 
-    # Check for last checkpoint
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-        logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
-    # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    dataset = load_dataset("json", data_files=script_args.dataset_name)
 
-    # Load the dataset
-    dataset = load_dataset('json', data_files=script_args.dataset_name)
-    # Load the image from the dataset
     def load_image_from_path(example):
         if "solution" not in example:
             example["solution"] = example["label"]
         if "label" in example:
             example.pop("label", None)
 
-        image = Image.open(example["image_path"])  
-        image = image.convert("RGBA") 
-        example["image"] = image  
+        image = Image.open(example["image_path"])
+        image = image.convert("RGBA")
+        example["image"] = image
         return example
 
-    # Format into conversation
     def make_conversation(example):
         return {
             "prompt": [
@@ -231,9 +184,7 @@ def main(script_args, training_args, model_args):
             ],
         }
 
-
-
-    QUESTION_TEMPLATE = "{Question}"
+    question_template = "{Question}"
 
     def make_conversation_image(example):
         return {
@@ -248,12 +199,11 @@ def main(script_args, training_args, model_args):
                     "role": "user",
                     "content": [
                         {"type": "image"},
-                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example[script_args.query_key])},
+                        {"type": "text", "text": question_template.format(Question=example[script_args.query_key])},
                     ],
                 },
             ],
         }
-
 
     if "image_path" in dataset[script_args.dataset_train_split].features:
         print("image in dataset")
@@ -262,10 +212,9 @@ def main(script_args, training_args, model_args):
     else:
         print("no image in dataset")
         dataset = dataset.map(make_conversation)
-        dataset = dataset.remove_columns("query")
+        if "query" in dataset[script_args.dataset_train_split].column_names:
+            dataset = dataset.remove_columns("query")
 
-    # breakpoint()
-    
     if script_args.use_tool:
         trainer_cls = Qwen2VLGRPOToolTrainer if not training_args.use_vllm else Qwen2VLGRPOToolVLLMTrainer
         trainer = trainer_cls(
@@ -295,22 +244,13 @@ def main(script_args, training_args, model_args):
         )
     print("using: ", trainer_cls)
 
-    # Initialize the GRPO trainer
-
-
-    # Train and push the model to the Hub
-    trainer.train()
-
-    # Su: add the train from the saved checkpoint
-
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
-    # Save and push to hub
+    trainer.train(resume_from_checkpoint=checkpoint)
     trainer.save_model(training_args.output_dir)
     if training_args.push_to_hub:
         trainer.push_to_hub(dataset_name=script_args.dataset_name)
