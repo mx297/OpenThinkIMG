@@ -1,0 +1,5 @@
+from . import tool_vllm_grpo_trainer as _orig
+from .tool_generation_safe import vllm_generate_with_tool_calls
+
+_orig.vllm_generate_with_tool_calls = vllm_generate_with_tool_calls
+Qwen2VLGRPOVLLMTrainer = _orig.Qwen2VLGRPOVLLMTrainer
