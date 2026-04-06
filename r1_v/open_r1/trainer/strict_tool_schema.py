@@ -191,6 +191,15 @@ def validate_tool_message(output_text: str) -> ValidationResult:
 
     score = 0.35
     actions = parsed_data["actions"]
+    if len(actions) == 0:
+        return _make_result(
+            True,
+            1.0,
+            parsed_data=parsed_data,
+            action_name="",
+            action_arguments={},
+        )
+
     if len(actions) != 1:
         return _make_result(
             False,

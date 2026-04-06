@@ -143,6 +143,15 @@ def vllm_generate_with_tool_calls(
             cfg = validation.as_api_config()
             api_name = validation.action_name
             api_params = validation.action_arguments or {}
+
+            if api_name == "" and api_params == {}:
+                input_data[input_idx]["conversations"] = append_conversation_fn(
+                    conversation=input_data[input_idx]["conversations"],
+                    text=input_data[input_idx]["prompt"],
+                    role="user",
+                )
+                continue
+
             input_data[input_idx]["tool_cfgs"].append(cfg)
 
             if api_name == "Terminate":
