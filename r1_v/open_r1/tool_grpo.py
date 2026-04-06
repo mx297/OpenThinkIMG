@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -40,7 +41,9 @@ from r1_v.open_r1.trainer.strict_tool_schema import extract_terminate_answer, sc
 class GRPOScriptArguments(ScriptArguments):
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format"],
-        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format', 'strict_format'"},
+        metadata={
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'strict_format', 'loose_format', 'legacy_format'"
+        },
     )
     max_pixels: Optional[int] = field(
         default=12845056,
@@ -57,6 +60,10 @@ class GRPOScriptArguments(ScriptArguments):
     tool_runtime_variant: str = field(
         default="safe",
         metadata={"help": "Tool runtime implementation to use when --use_tool and --use_vllm are enabled. One of: 'safe', 'legacy'."},
+    )
+    system_prompt_variant: str = field(
+        default="auto",
+        metadata={"help": "Instruction prompt style to use. One of: 'auto', 'strict', 'legacy'. In auto mode, legacy is used when only loose format rewards are selected; otherwise strict is used."},
     )
     query_key: Optional[str] = field(default="question")
     controller_addr: Optional[str] = field(
@@ -114,14 +121,43 @@ def format_reward(completions, **kwargs):
     return rewards
 
 
+def loose_format_reward(completions, **kwargs):
+    output_texts = kwargs.get("model_output_texts")
+    if not output_texts:
+        pattern = r".*Terminate.*"
+        completion_contents = [completion[0]["content"] for completion in completions]
+        matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+        return [1.0 if match else 0.0 for match in matches]
+
+    rewards = []
+    pattern = r"\{(?:[^{}]|\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})*\}"
+    for output_text in output_texts:
+        current_rewards = []
+        for output_text_item in output_text:
+            reward = 0.0
+            try:
+                match = re.search(pattern, output_text_item)
+                assert match is not None
+                data = json.loads(match.group(0))
+                assert "thought" in data or "thoughts" in data or "actions" in data
+                reward = 1.0
+            except Exception:
+                reward = 0.0
+            current_rewards.append(reward)
+        rewards.append(sum(current_rewards) / len(current_rewards) if current_rewards else 0.0)
+    return rewards
+
+
 reward_funcs_registry = {
     "accuracy": accuracy_reward,
     "format": format_reward,
     "strict_format": format_reward,
+    "loose_format": loose_format_reward,
+    "legacy_format": loose_format_reward,
 }
 
 
-SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving steps for chart-based reasoning. Your goal is to answer chart-related questions. You can rely on your own capabilities or use external tools to assist in solving. Here are the available actions:
+STRICT_SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving steps for chart-based reasoning. Your goal is to answer chart-related questions. You can rely on your own capabilities or use external tools to assist in solving. Here are the available actions:
 - **OCR**: Extracts text from an image. Example: `{"name": "OCR", "arguments": {"image": "img_1"}}`
 - **Point**: Identifies a point in the image based on description and returns coordinates. Example: `{"name": "Point", "arguments": {"image": "img_1", "param": "x-axis value 1970"}}`
 - **ZoomInSubfigure**: Crops the image to the specified subfigure. Example: `{"name": "ZoomInSubfigure", "arguments": {"image": "img_1", "param": "Downstream vs. Concept: Toy"}}`
@@ -131,17 +167,34 @@ SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving 
 - **Terminate**: Ends the task and provides the final answer. Example: `{"name": "Terminate", "arguments": {"ans": "1985"}}`
 
 Strict formatting rules:
-1. Your entire response must be exactly one JSON object with top-level keys "thought" and "actions".
+1. Your entire response must be exactly one JSON object with top-level keys \"thought\" and \"actions\".
 2. Output exactly one action per response.
 3. Tool names are case-sensitive and must exactly match the names above.
-4. `SegmentRegionAroundPoint.arguments.param` must exactly match `x="<number>" y="<number>"` with no extra spaces.
+4. `SegmentRegionAroundPoint.arguments.param` must exactly match `x=\"<number>\" y=\"<number>\"` with no extra spaces.
 5. `DrawHorizontalLineByY.arguments.param` must exactly match `y=<number>`.
 6. `DrawVerticalLineByX.arguments.param` must exactly match `x=<number>`.
-7. `Terminate.arguments.ans` must always be a JSON string, even for numeric answers, for example `{"ans": "2000"}`.
+7. `Terminate.arguments.ans` must always be a JSON string, even for numeric answers, for example `{\"ans\": \"2000\"}`.
 
 To solve the problem:
 1. Select actions from the provided tools list, combining them logically and building on previous steps. Call one action at a time, using its output for the next.
-2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call "Point" to get coordinates for further actions.
+2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call \"Point\" to get coordinates for further actions.
+"""
+
+LEGACY_SYSTEM_PROMPT = """You are a visual assistant capable of generating and solving steps for chart-based reasoning. Your goal is to answer chart-related questions. You can rely on your own capabilities or use external tools to assist in solving. Here are the available actions:
+- **OCR**: Extracts text from an image. Example: `{"name": "OCR", "arguments": {"image": "img_1"}}`
+- **Point**: Identifies a point in the image based on description and returns coordinates. Example: `{"name": "Point", "arguments": {"image": "img_1", "param": "x-axis value 1970"}}`
+- **ZoomInSubfigure**: Crops the image to the specified subfigure. Example: `{"name": "ZoomInSubfigure", "arguments": {"image": "img_1", "param": "Downstream vs. Concept: Toy"}}`
+- **SegmentRegionAroundPoint**: Segments a region around a given point. Example: `{"name": "SegmentRegionAroundPoint", "arguments": {"image": "img_1", "param": "x=\\"21.5\\" y=\\"28.5\\""}}`
+- **DrawHorizontalLineByY**: Draws a horizontal line at a given y-coordinate. Example: `{"name": "DrawHorizontalLineByY", "arguments": {"image": "img_1", "param": "y=28.5"}}`
+- **DrawVerticalLineByX**: Draws a vertical line at a given x-coordinate. Example: `{"name": "DrawVerticalLineByX", "arguments": {"image": "img_1", "param": "x=21.5"}}`
+- **Terminate**: Ends the task and provides the final answer. Example: `{"name": "Terminate", "arguments": {"ans": "1985"}}`
+
+To solve the problem:
+1. Select actions from the provided tools list, combining them logically and building on previous steps. Call one action at a time, using its output for the next.
+2. To use `SegmentRegionAroundPoint`, `DrawHorizontalLineByY`, or `DrawVerticalLineByX`, first call \"Point\" to get coordinates for further actions.
+
+Your output should be in a JSON format as follows:
+{"thought": "the reasoning process", "actions": [{"name": "action", "arguments": {"argument1": "value1", "argument2": "value2"}}]}
 """
 
 
@@ -155,6 +208,24 @@ def _get_tool_vllm_trainer(runtime_variant: str):
     )
 
 
+def _get_system_prompt(prompt_variant: str, reward_func_names: list[str]) -> tuple[str, str]:
+    normalized = set(reward_func_names)
+    if prompt_variant == "strict":
+        return STRICT_SYSTEM_PROMPT, "strict"
+    if prompt_variant == "legacy":
+        return LEGACY_SYSTEM_PROMPT, "legacy"
+    if prompt_variant != "auto":
+        raise ValueError(
+            f"Unsupported system_prompt_variant={prompt_variant!r}. Expected one of: 'auto', 'strict', 'legacy'."
+        )
+
+    strict_selected = any(name in normalized for name in ["format", "strict_format"])
+    loose_selected = any(name in normalized for name in ["loose_format", "legacy_format"])
+    if loose_selected and not strict_selected:
+        return LEGACY_SYSTEM_PROMPT, "legacy"
+    return STRICT_SYSTEM_PROMPT, "strict"
+
+
 def main(script_args, training_args, model_args):
     set_seed(training_args.seed)
 
@@ -163,6 +234,9 @@ def main(script_args, training_args, model_args):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
 
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    system_prompt, resolved_prompt_variant = _get_system_prompt(
+        script_args.system_prompt_variant, script_args.reward_funcs
+    )
     dataset = load_dataset("json", data_files=script_args.dataset_name)
 
     def load_image_from_path(example):
@@ -179,7 +253,7 @@ def main(script_args, training_args, model_args):
     def make_conversation(example):
         return {
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": example[script_args.query_key]},
             ],
         }
@@ -192,7 +266,7 @@ def main(script_args, training_args, model_args):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": SYSTEM_PROMPT},
+                        {"type": "text", "text": system_prompt},
                     ],
                 },
                 {
@@ -246,6 +320,8 @@ def main(script_args, training_args, model_args):
             min_pixels=script_args.min_pixels,
         )
     print("using: ", trainer_cls)
+    print("reward_funcs:", script_args.reward_funcs)
+    print("system_prompt_variant:", resolved_prompt_variant)
     if script_args.use_tool and training_args.use_vllm:
         print("tool_runtime_variant:", script_args.tool_runtime_variant)
 
